@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -13,6 +14,33 @@ from playwright.async_api import async_playwright
 WIDTH, HEIGHT = 640, 480
 JPEG_QUALITY = 40
 CAPTURE_INTERVAL = 0.08
+START_URL = "https://duckduckgo.com"
+
+# (종류, 주소) - 위에서부터 순서대로 시도. 죽은 인스턴스는 자동으로 건너뜀
+# 인스턴스는 자주 바뀌니 Render 환경변수 INSTANCES로 덮어쓸 수 있음
+# 예: piped|https://piped.private.coffee,invidious|https://yewtu.be
+DEFAULT_INSTANCES = [
+    ("invidious", "https://yewtu.be"),
+    ("invidious", "https://inv.nadeko.net"),
+    ("piped", "https://piped.private.coffee"),
+    ("piped", "https://piped.video"),
+    ("invidious", "https://invidious.nerdvpn.net"),
+]
+
+
+def load_instances():
+    env = os.environ.get("INSTANCES", "").strip()
+    if not env:
+        return DEFAULT_INSTANCES
+    out = []
+    for item in env.split(","):
+        if "|" in item:
+            kind, base = item.split("|", 1)
+            out.append((kind.strip().lower(), base.strip().rstrip("/")))
+    return out or DEFAULT_INSTANCES
+
+
+INSTANCES = load_instances()
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -24,10 +52,10 @@ browser = None
 context = None
 page = None
 startup_error = None
-
 latest = None
 frame_id = 0
 capture_task = None
+last_instance = None  # 마지막으로 성공한 인스턴스 (다음에 먼저 시도)
 
 YT_PATTERNS = [
     r"(?:youtube\.com|youtube-nocookie\.com)/watch\?(?:.*&)?v=([\w-]{11})",
@@ -36,26 +64,56 @@ YT_PATTERNS = [
 ]
 
 
-def normalize_url(raw: str) -> str:
+def video_url(kind, base, vid):
+    return f"{base}/watch?v={vid}" + ("&autoplay=1" if kind == "invidious" else "")
+
+
+def search_url(kind, base, q):
+    if kind == "piped":
+        return f"{base}/results?search_query={quote_plus(q)}"
+    return f"{base}/search?q={quote_plus(q)}"
+
+
+def home_url(kind, base):
+    return base + "/"
+
+
+def build_candidates(raw: str):
+    """입력값 -> 시도할 URL 목록 (순서대로)"""
     raw = raw.strip()
 
-    # 유튜브 링크면 임베드 주소로 변환
+    # 1) 유튜브 영상 링크 -> 인스턴스로
     for pat in YT_PATTERNS:
         m = re.search(pat, raw)
         if m:
-            return (
-                f"https://www.youtube-nocookie.com/embed/{m.group(1)}"
-                "?autoplay=1&rel=0&playsinline=1&hl=ko"
-            )
+            return [video_url(k, b, m.group(1)) for k, b in ordered_instances()]
 
+    # 2) "yt 검색어" 또는 "yt:검색어" -> 인스턴스 검색
+    m = re.match(r"^(?:yt|youtube|유튜브)\s*[: ]\s*(.+)$", raw, re.I)
+    if m:
+        q = m.group(1)
+        return [search_url(k, b, q) for k, b in ordered_instances()]
+
+    # 3) 유튜브 메인
+    if re.match(r"^(https?://)?(www\.|m\.)?youtube\.com/?$", raw):
+        return [home_url(k, b) for k, b in ordered_instances()]
+
+    # 4) 일반 주소
     if raw.startswith(("http://", "https://")):
-        return raw
+        return [raw]
 
-    # 주소가 아니라 검색어처럼 보이면 구글 검색
-    if "." not in raw or " " in raw:
-        return "https://www.google.com/search?q=" + quote_plus(raw)
+    # 5) 주소 형태(점 있고 공백 없음)
+    if "." in raw and " " not in raw:
+        return ["https://" + raw]
 
-    return "https://" + raw
+    # 6) 그 외는 DuckDuckGo 검색
+    return ["https://duckduckgo.com/?q=" + quote_plus(raw)]
+
+
+def ordered_instances():
+    if last_instance and last_instance in INSTANCES:
+        return [last_instance] + [i for i in INSTANCES if i != last_instance]
+    return INSTANCES
 
 
 async def capture_loop():
@@ -84,7 +142,6 @@ async def lifespan(app: FastAPI):
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
                 "--autoplay-policy=no-user-gesture-required",
             ],
         )
@@ -95,21 +152,11 @@ async def lifespan(app: FastAPI):
             timezone_id="Asia/Seoul",
             extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8"},
         )
-        await context.add_init_script(
-            """
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR','ko','en-US','en']});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-            window.chrome = window.chrome || { runtime: {} };
-            """
-        )
         page = await context.new_page()
         print("Chromium launched successfully!")
         capture_task = asyncio.create_task(capture_loop())
         try:
-            await page.goto(
-                "https://www.google.com", timeout=30000, wait_until="domcontentloaded"
-            )
+            await page.goto(START_URL, timeout=30000, wait_until="domcontentloaded")
         except Exception as e:
             print(f"Initial page load failed: {e}")
     except Exception as e:
@@ -179,6 +226,7 @@ async def root():
         "browser_ready": page is not None,
         "frame": frame_id,
         "url": page.url if page else None,
+        "instances": [f"{k}|{b}" for k, b in INSTANCES],
     }
 
 
@@ -210,14 +258,27 @@ async def click_page(data: ClickData):
 
 @app.post("/navigate")
 async def navigate_page(data: NavigateData):
+    global last_instance
     if not page:
         return not_ready()
-    try:
-        target_url = normalize_url(data.url)
-        await page.goto(target_url, timeout=20000, wait_until="domcontentloaded")
-        return {"status": "success", "url": target_url}
-    except Exception as e:
-        return fail(e)
+
+    candidates = build_candidates(data.url)
+    last_err = None
+    for url in candidates[:4]:  # 최대 4곳까지만 시도
+        try:
+            resp = await page.goto(url, timeout=12000, wait_until="domcontentloaded")
+            if resp is not None and resp.status >= 400:
+                last_err = f"{url} -> HTTP {resp.status}"
+                continue
+            for inst in INSTANCES:
+                if url.startswith(inst[1]):
+                    last_instance = inst
+                    break
+            return {"status": "success", "url": url}
+        except Exception as e:
+            last_err = f"{url} -> {e}"
+            continue
+    return JSONResponse({"error": last_err or "이동 실패"}, status_code=502)
 
 
 @app.post("/input")
