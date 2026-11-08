@@ -57,6 +57,12 @@ frame_id = 0
 capture_task = None
 last_instance = None  # 마지막으로 성공한 인스턴스 (다음에 먼저 시도)
 
+# 마지막 클릭 위치 (우클릭 버튼은 좌표 없이 오므로 이 위치를 사용)
+mouse_pos = [WIDTH // 2, HEIGHT // 2]
+
+# 클라이언트 키 이름 -> Playwright 키 이름
+KEY_MAP = {"enter": "Enter", "back": "Backspace", "space": " ", "tab": "Tab"}
+
 YT_PATTERNS = [
     r"(?:youtube\.com|youtube-nocookie\.com)/watch\?(?:.*&)?v=([\w-]{11})",
     r"youtu\.be/([\w-]{11})",
@@ -121,12 +127,13 @@ async def capture_loop():
     while True:
         try:
             if page:
-                data = await page.screenshot(type="jpeg", quality=JPEG_QUALITY)
+                data = await page.screenshot(type="jpeg", quality=JPEG_QUALITY, timeout=5000)
                 if data != latest:
                     latest = data
                     frame_id += 1
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"capture error: {e}")
+            await asyncio.sleep(1)
         await asyncio.sleep(CAPTURE_INTERVAL)
 
 
@@ -187,8 +194,9 @@ app.add_middleware(
 
 
 class ClickData(BaseModel):
-    x: int
-    y: int
+    x: Optional[int] = None
+    y: Optional[int] = None
+    button: str = "left"
 
 
 class NavigateData(BaseModel):
@@ -250,7 +258,10 @@ async def click_page(data: ClickData):
     if not page:
         return not_ready()
     try:
-        await page.mouse.click(data.x, data.y)
+        if data.x is not None and data.y is not None:
+            mouse_pos[0], mouse_pos[1] = data.x, data.y
+        btn = data.button if data.button in ("left", "right") else "left"
+        await page.mouse.click(mouse_pos[0], mouse_pos[1], button=btn)
         return {"status": "success"}
     except Exception as e:
         return fail(e)
@@ -300,7 +311,7 @@ async def press_key(data: KeyData):
     if not page:
         return not_ready()
     try:
-        await page.keyboard.press(data.key)
+        await page.keyboard.press(KEY_MAP.get(data.key.lower(), data.key))
         return {"status": "success"}
     except Exception as e:
         return fail(e)
