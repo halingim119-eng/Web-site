@@ -1,66 +1,112 @@
-from fastapi import FastAPI, Response
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-playwright = None
+pw = None
 browser = None
 page = None
+startup_error = None
 
-@app.on_event("startup")
-def startup_event():
-    global playwright, browser, page
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global pw, browser, page, startup_error
     try:
-        playwright = sync_playwright().start()
-        browser = playwright.chromium.launch(
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
         )
-        page = browser.new_page(viewport={"width": 800, "height": 600})
-        page.goto("https://www.google.com")
+        page = await browser.new_page(viewport={"width": 800, "height": 600})
         print("Chromium launched successfully!")
+        try:
+            await page.goto("https://www.google.com", timeout=30000)
+        except Exception as e:
+            print(f"Initial page load failed: {e}")
     except Exception as e:
+        startup_error = str(e)
         print(f"Error launching browser: {e}")
+
+    yield
+
+    try:
+        if browser:
+            await browser.close()
+        if pw:
+            await pw.stop()
+    except Exception:
+        pass
+
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 class ClickData(BaseModel):
     x: int
     y: int
 
+
 class NavigateData(BaseModel):
     url: str
 
+
+def not_ready():
+    msg = "Browser not ready"
+    if startup_error:
+        msg += ": " + startup_error[:150]
+    return JSONResponse({"error": msg}, status_code=503)
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "browser_ready": page is not None}
+
+
 @app.get("/screenshot")
-def get_screenshot():
+async def get_screenshot():
     if not page:
-        return {"error": "Browser not ready yet"}, 500
+        return not_ready()
     try:
-        screenshot_bytes = page.screenshot(type="jpeg", quality=40)
-        return Response(content=screenshot_bytes, media_type="image/jpeg")
+        data = await page.screenshot(type="jpeg", quality=40)
+        return Response(content=data, media_type="image/jpeg")
     except Exception as e:
-        return {"error": str(e)}
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 
 @app.post("/click")
-def click_page(data: ClickData):
+async def click_page(data: ClickData):
     if not page:
-        return {"error": "Browser not ready yet"}, 500
+        return not_ready()
     try:
-        page.mouse.click(data.x, data.y)
+        await page.mouse.click(data.x, data.y)
         return {"status": "success"}
     except Exception as e:
-        return {"error": str(e)}
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 
 @app.post("/navigate")
-def navigate_page(data: NavigateData):
+async def navigate_page(data: NavigateData):
     if not page:
-        return {"error": "Browser not ready yet"}, 500
+        return not_ready()
     try:
-        target_url = data.url
-        if not target_url.startswith("http://") and not target_url.startswith("https://"):
+        target_url = data.url.strip()
+        if not target_url.startswith(("http://", "https://")):
             target_url = "https://" + target_url
-        page.goto(target_url, timeout=15000)
+        await page.goto(target_url, timeout=15000)
         return {"status": "success", "url": target_url}
     except Exception as e:
-        return {"error": str(e)}
+        return JSONResponse({"error": str(e)}, status_code=500)
