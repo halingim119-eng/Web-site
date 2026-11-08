@@ -2,7 +2,6 @@ from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
-import os
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -11,7 +10,6 @@ playwright = None
 browser = None
 page = None
 
-# 서버가 실행될 때 안전하게 브라우저를 켭니다.
 @app.on_event("startup")
 def startup_event():
     global playwright, browser, page
@@ -31,6 +29,9 @@ class ClickData(BaseModel):
     x: int
     y: int
 
+class NavigateData(BaseModel):
+    url: str
+
 @app.get("/screenshot")
 def get_screenshot():
     if not page:
@@ -48,5 +49,18 @@ def click_page(data: ClickData):
     try:
         page.mouse.click(data.x, data.y)
         return {"status": "success"}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/navigate")
+def navigate_page(data: NavigateData):
+    if not page:
+        return {"error": "Browser not ready yet"}, 500
+    try:
+        target_url = data.url
+        if not target_url.startswith("http://") and not target_url.startswith("https://"):
+            target_url = "https://" + target_url
+        page.goto(target_url, timeout=15000)
+        return {"status": "success", "url": target_url}
     except Exception as e:
         return {"error": str(e)}
