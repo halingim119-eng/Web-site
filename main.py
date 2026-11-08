@@ -64,6 +64,18 @@ class NavigateData(BaseModel):
     url: str
 
 
+class TypeData(BaseModel):
+    text: str
+
+
+class KeyData(BaseModel):
+    key: str
+
+
+class ScrollData(BaseModel):
+    dy: int
+
+
 def not_ready():
     msg = "Browser not ready"
     if startup_error:
@@ -108,5 +120,38 @@ async def navigate_page(data: NavigateData):
             target_url = "https://" + target_url
         await page.goto(target_url, timeout=15000)
         return {"status": "success", "url": target_url}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/type")
+async def type_text(data: TypeData):
+    if not page:
+        return not_ready()
+    try:
+        await page.keyboard.type(data.text, delay=10)
+        return {"status": "success"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/key")
+async def press_key(data: KeyData):
+    if not page:
+        return not_ready()
+    try:
+        await page.keyboard.press(data.key)
+        return {"status": "success"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/scroll")
+async def scroll_page(data: ScrollData):
+    if not page:
+        return not_ready()
+    try:
+        await page.mouse.wheel(0, data.dy)
+        return {"status": "success"}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
